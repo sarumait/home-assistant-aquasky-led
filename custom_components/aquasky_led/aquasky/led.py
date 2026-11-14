@@ -13,7 +13,6 @@ NOTIFY_UUID = "00001002-0000-1000-8000-00805f9b34fb"
 
 _CHANNEL_COUNT = 4
 _BRIGHTNESS_MAX = 1000
-_STATE_TIMEOUT = 2.0  # seconds to wait for a state notification response
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +67,6 @@ class BLELed:
     def __init__(self, ble_device: BLEDevice) -> None:
         self.ble_device = ble_device
         self._lock = asyncio.Lock()
-        self._client: BleakClientWithServiceCache | None = None
-        self._notify_buf = bytearray()
-        self._state_event = asyncio.Event()
         self.is_on: bool | None = None
         self._brightness: int = _BRIGHTNESS_MAX  # 0–1000
 
@@ -80,10 +76,6 @@ class BLELed:
         if self.is_on is None:
             return None
         return self._brightness / _BRIGHTNESS_MAX
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     async def turn_on(self) -> None:
         await self._send(encode_message(bytes([0x68, 0x03, 0x01, 0x6A])))
@@ -100,80 +92,62 @@ class BLELed:
         self._brightness = v
 
     async def read_state(self) -> None:
-        """Request device state; waits for the notification response."""
+        """Poll device state; updates self.is_on and self._brightness."""
+        buf = bytearray()
+
+        def _on_notify(_: BleakGATTCharacteristic, data: bytearray) -> None:
+            buf.extend(decode_message(bytes(data)))
+
         async with self._lock:
-            self._notify_buf.clear()
-            self._state_event.clear()
-            client = await self._ensure_connected()
-            await client.write_gatt_char(
-                WRITE_UUID,
-                encode_message(bytes([0x68, 0x05, 0x6D])),
-                response=False,
+            client = await establish_connection(
+                BleakClientWithServiceCache,
+                self.ble_device,
+                self.ble_device.name,
+                max_attempts=3,
             )
+            try:
+                await client.start_notify(NOTIFY_UUID, _on_notify)
+                await client.write_gatt_char(
+                    WRITE_UUID,
+                    encode_message(bytes([0x68, 0x05, 0x6D])),
+                    response=False,
+                )
+                await asyncio.sleep(0.3)
+                await client.stop_notify(NOTIFY_UUID)
+            finally:
+                await client.disconnect()
 
-        try:
-            await asyncio.wait_for(self._state_event.wait(), timeout=_STATE_TIMEOUT)
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timed out waiting for state from %s", self.ble_device.address)
+        self._parse_state(bytes(buf))
 
-    async def disconnect(self) -> None:
-        """Close the BLE connection (called on integration unload)."""
-        if self._client and self._client.is_connected:
-            await self._client.disconnect()
-
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
-
-    async def _ensure_connected(self) -> BleakClientWithServiceCache:
-        """Return the connected client, reconnecting if the connection dropped."""
-        if self._client is not None and self._client.is_connected:
-            return self._client
-
-        _LOGGER.debug("Connecting to %s", self.ble_device.address)
-        self._client = await establish_connection(
-            BleakClientWithServiceCache,
-            self.ble_device,
-            self.ble_device.name,
-            disconnected_callback=self._on_disconnect,
-            max_attempts=3,
-        )
-        await self._client.start_notify(NOTIFY_UUID, self._on_notify)
-        _LOGGER.debug("Connected to %s", self.ble_device.address)
-        return self._client
-
-    def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
-        """Called by bleak when the connection drops unexpectedly."""
-        _LOGGER.debug("Disconnected from %s — will reconnect on next operation", self.ble_device.address)
-        self._client = None
-
-    def _on_notify(self, _: BleakGATTCharacteristic, data: bytearray) -> None:
-        """Accumulate notification fragments and parse state when complete."""
-        self._notify_buf.extend(decode_message(bytes(data)))
+    def _parse_state(self, raw: bytes) -> None:
         expected = _CHANNEL_COUNT * 6 + 6
-        raw = bytes(self._notify_buf)
-        if len(raw) >= expected and raw[0] == 0x68 and raw[1] == 0x05 and raw[2] == 0x00:
-            self._parse_state(raw)
-            self._notify_buf.clear()
-            self._state_event.set()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        if (
+            len(raw) >= expected
+            and raw[0] == 0x68
+            and raw[1] == 0x05
+            and raw[2] == 0x00
+        ):
+            self.is_on = bool(raw[3] & 1)
+            channels = [
+                raw[5 + i * 2] | (raw[6 + i * 2] << 8)
+                for i in range(_CHANNEL_COUNT)
+            ]
+            self._brightness = max(channels) if channels else 0
+            _LOGGER.debug(
+                "State: on=%s brightness=%s channels=%s",
+                self.is_on, self._brightness, channels,
+            )
 
     async def _send(self, command: bytes) -> None:
         async with self._lock:
-            client = await self._ensure_connected()
-            await client.write_gatt_char(WRITE_UUID, command, response=False)
-
-    def _parse_state(self, raw: bytes) -> None:
-        self.is_on = bool(raw[3] & 1)
-        channels = [
-            raw[5 + i * 2] | (raw[6 + i * 2] << 8)
-            for i in range(_CHANNEL_COUNT)
-        ]
-        self._brightness = max(channels) if channels else 0
-        _LOGGER.debug(
-            "State: on=%s brightness=%s channels=%s",
-            self.is_on, self._brightness, channels,
-        )
+            client = await establish_connection(
+                BleakClientWithServiceCache,
+                self.ble_device,
+                self.ble_device.name,
+                max_attempts=3,
+            )
+            _LOGGER.debug("Sending command to %s", self.ble_device.address)
+            try:
+                await client.write_gatt_char(WRITE_UUID, command, response=False)
+            finally:
+                await client.disconnect()

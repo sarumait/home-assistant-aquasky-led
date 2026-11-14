@@ -75,7 +75,3 @@ class AquaskyLightEntity(LightEntity):
             await self._led.read_state()
         except Exception:
             _LOGGER.warning("State poll failed for %s", self._led.ble_device.address)
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Close BLE connection on unload."""
-        await self._led.disconnect()
